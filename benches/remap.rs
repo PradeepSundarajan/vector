@@ -7,7 +7,7 @@ use vector::{
     event::{Event, LogEvent, Value},
     transforms::{
         SyncTransform, TransformOutputsBuf,
-        remap::{Remap, RemapConfig},
+        remap::{Remap, RemapConfig, VrlProgram},
     },
 };
 use vrl::{event_path, prelude::*};
@@ -53,14 +53,13 @@ fn benchmark_remap(c: &mut Criterion) {
         let mut tform: Box<dyn SyncTransform> = Box::new(
             Remap::new_ast(
                 RemapConfig {
-                    source: Some(
+                    source: Some(VrlProgram::Source(
                         indoc! {r#".foo = "bar"
                             .bar = "baz"
                             .copy = string!(.copy_from)
                         "#}
                         .to_string(),
-                    ),
-                    file: None,
+                    )),
                     timezone: None,
                     drop_on_error: true,
                     drop_on_abort: true,
@@ -112,8 +111,9 @@ fn benchmark_remap(c: &mut Criterion) {
         let mut tform: Box<dyn SyncTransform> = Box::new(
             Remap::new_ast(
                 RemapConfig {
-                    source: Some(".bar = parse_json!(string!(.foo))".to_owned()),
-                    file: None,
+                    source: Some(VrlProgram::Source(
+                        ".bar = parse_json!(string!(.foo))".to_owned(),
+                    )),
                     timezone: None,
                     drop_on_error: true,
                     drop_on_abort: true,
@@ -169,13 +169,12 @@ fn benchmark_remap(c: &mut Criterion) {
     group.bench_function("coerce/remap", |b| {
         let mut tform: Box<dyn SyncTransform> = Box::new(
             Remap::new_ast(RemapConfig {
-                source: Some(indoc! {r#"
+                source: Some(VrlProgram::Source(indoc! {r#"
                     .number = to_int!(.number)
                     .bool = to_bool!(.bool)
                     .timestamp = parse_timestamp!(string!(.timestamp), format: "%d/%m/%Y:%H:%M:%S %z")
                 "#}
-                .to_owned()),
-                file: None,
+                .to_owned())),
                 timezone: None,
                 drop_on_error: true,
                 drop_on_abort: true,

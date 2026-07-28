@@ -9,13 +9,14 @@ use std::{
     sync::Mutex,
 };
 
+use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use vector_lib::{
     TimeZone,
     codecs::MetricTagValues,
     compile_vrl,
     config::LogNamespace,
-    configurable::configurable_component,
+    configurable::{Configurable, configurable_component},
     enrichment::TableRegistry,
     lookup::{PathPrefix, metadata_path, owned_value_path},
     schema::Definition,
@@ -37,7 +38,7 @@ use vrl::{
 use crate::{
     Result,
     config::{
-        ComponentKey, DataType, Input, OutputId, TransformConfig, TransformContext,
+        ComponentKey, DataType, GenerateConfig, Input, OutputId, TransformConfig, TransformContext,
         TransformOutput, log_schema,
     },
     event::{Event, TargetEvents, VrlTarget},
@@ -51,43 +52,103 @@ const DROPPED: &str = "dropped";
 type CacheKey = (TableRegistry, schema::Definition);
 type CacheValue = (Program, String, MeaningList);
 
-/// Configuration for the `remap` transform.
-#[configurable_component(transform(
-    "remap",
-    "Modify your observability data as it passes through your topology using Vector Remap Language (VRL)."
-))]
-#[derive(Derivative)]
-#[serde(deny_unknown_fields)]
-#[derivative(Default, Debug)]
-pub struct RemapConfig {
-    /// The [Vector Remap Language][vrl] (VRL) program to execute for each event.
-    ///
-    /// Required if `file` is missing.
+/// The VRL program to execute — an inline program provided as a string, or a `type`-tagged
+/// object selecting where the program comes from.
+#[derive(Configurable, Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum VrlProgram {
+    /// Inline [Vector Remap Language][vrl] (VRL) program provided as a string.
     ///
     /// [vrl]: https://vector.dev/docs/reference/vrl
-    #[configurable(metadata(
-        docs::examples = ". = parse_json!(.message)\n.new_field = \"new value\"\n.status = to_int!(.status)\n.duration = parse_duration!(.duration, \"s\")\n.new_name = del(.old_name)",
-        docs::required,
-        docs::syntax_override = "remap_program"
-    ))]
-    pub source: Option<String>,
+    Source(
+        #[configurable(metadata(
+            docs::examples = ". = parse_json!(.message)\n.new_field = \"new value\"\n.status = to_int!(.status)\n.duration = parse_duration!(.duration, \"s\")\n.new_name = del(.old_name)",
+            docs::syntax_override = "remap_program"
+        ))]
+        String,
+    ),
+    /// A VRL program selected by `type`: an inline `vrl` program or one loaded from `disk`.
+    Structured(VrlProgramType),
+}
+
+/// Where a VRL program comes from.
+#[derive(Configurable, Serialize, Deserialize, Clone, Debug)]
+#[configurable(metadata(docs::enum_tag_description = "The source of the VRL program."))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VrlProgramType {
+    /// An inline [Vector Remap Language][vrl] (VRL) program.
+    ///
+    /// [vrl]: https://vector.dev/docs/reference/vrl
+    Vrl {
+        /// The inline VRL program to execute for each event.
+        #[configurable(metadata(
+            docs::examples = ". = parse_json!(.message)\n.new_field = \"new value\"",
+            docs::syntax_override = "remap_program"
+        ))]
+        program: String,
+    },
+    /// VRL programs loaded from files on disk, concatenated in order.
+    Disk {
+        /// File paths to the [Vector Remap Language][vrl] (VRL) programs to execute for each event.
+        ///
+        /// If a relative path is provided, its root is the current working directory.
+        ///
+        /// [vrl]: https://vector.dev/docs/reference/vrl
+        #[configurable(metadata(
+            docs::examples = "path/to/program_1.vrl",
+            docs::examples = "path/to/program_2.vrl"
+        ))]
+        files: Vec<PathBuf>,
+    },
+}
+
+impl Default for VrlProgram {
+    fn default() -> Self {
+        Self::Source(String::new())
+    }
+}
+
+/// Configuration for the `remap` transform.
+#[configurable_component(
+    transform(
+        "remap",
+        "Modify your observability data as it passes through your topology using Vector Remap Language (VRL)."
+    ),
+    no_deser
+)]
+#[derive(Derivative)]
+#[derivative(Default, Debug)]
+pub struct RemapConfig {
+    /// The VRL program to execute.
+    ///
+    /// Provide it as an inline string, as `{ type: vrl, program: "..." }`, or as
+    /// `{ type: disk, files: [...] }` to load one or more programs from disk. Exactly one of
+    /// `source`, `file`, or `files` must be set.
+    // Kept optional in the schema (rather than required) so the deprecated top-level `file`/`files`
+    // alternatives still validate; the deserializer enforces the exactly-one rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<VrlProgram>,
 
     /// File path to the [Vector Remap Language][vrl] (VRL) program to execute for each event.
     ///
     /// If a relative path is provided, its root is the current working directory.
     ///
-    /// Required if `source` is missing.
-    ///
     /// [vrl]: https://vector.dev/docs/reference/vrl
+    #[configurable(
+        deprecated = "This field is deprecated, use `source` with `type: disk` instead."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<PathBuf>,
 
     /// File paths to the [Vector Remap Language][vrl] (VRL) programs to execute for each event.
     ///
     /// If a relative path is provided, its root is the current working directory.
     ///
-    /// Required if `source` or `file` are missing.
-    ///
     /// [vrl]: https://vector.dev/docs/reference/vrl
+    #[configurable(
+        deprecated = "This field is deprecated, use `source` with `type: disk` instead."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<PathBuf>>,
 
     /// When set to `single`, metric tag values are exposed as single strings, the
@@ -182,13 +243,101 @@ impl Clone for RemapConfig {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemapConfigRaw {
+    /// Inline VRL string or structured object.
+    #[serde(default)]
+    source: Option<VrlProgram>,
+    /// Deprecated — use `source` with `type: disk` instead.
+    #[serde(default)]
+    file: Option<PathBuf>,
+    /// Deprecated — use `source` with `type: disk` instead.
+    #[serde(default)]
+    files: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    metric_tag_values: MetricTagValues,
+    #[serde(default)]
+    timezone: Option<TimeZone>,
+    #[serde(default = "crate::serde::default_false")]
+    drop_on_error: bool,
+    #[serde(default = "crate::serde::default_true")]
+    drop_on_abort: bool,
+    #[serde(default = "crate::serde::default_false")]
+    reroute_dropped: bool,
+    #[serde(default)]
+    runtime: VrlRuntime,
+}
+
+impl<'de> serde::Deserialize<'de> for RemapConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        RemapConfigRaw::deserialize(deserializer)
+            .and_then(|raw| RemapConfig::try_from(raw).map_err(serde::de::Error::custom))
+    }
+}
+
+impl TryFrom<RemapConfigRaw> for RemapConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RemapConfigRaw) -> std::result::Result<Self, Self::Error> {
+        // Enforce mutual exclusivity, but preserve whichever field the user wrote rather than
+        // folding `file`/`files` into `source`, so the config round-trips through serialization.
+        let provided =
+            raw.source.is_some() as u8 + raw.file.is_some() as u8 + raw.files.is_some() as u8;
+        if provided != 1 {
+            return Err("must provide exactly one of `source`, `file`, or `files`");
+        }
+        if raw.file.is_some() {
+            warn!(
+                "DEPRECATED: The `file` field on the `remap` transform is deprecated. Please use `source` with `type: disk` instead."
+            );
+        }
+        if raw.files.is_some() {
+            warn!(
+                "DEPRECATED: The `files` field on the `remap` transform is deprecated. Please use `source` with `type: disk` instead."
+            );
+        }
+        Ok(RemapConfig {
+            source: raw.source,
+            file: raw.file,
+            files: raw.files,
+            metric_tag_values: raw.metric_tag_values,
+            timezone: raw.timezone,
+            drop_on_error: raw.drop_on_error,
+            drop_on_abort: raw.drop_on_abort,
+            reroute_dropped: raw.reroute_dropped,
+            runtime: raw.runtime,
+            cache: Mutex::new(Default::default()),
+        })
+    }
+}
+
 impl RemapConfig {
+    /// Enforce that exactly one of `source`, `file`, or `files` is set.
+    ///
+    /// Deserialization already guarantees this, but `RemapConfig` is public and can be constructed
+    /// directly in Rust, so re-check it on the compile path to reject invalid combinations rather
+    /// than silently preferring one field.
+    fn validate_single_source(&self) -> Result<()> {
+        let provided =
+            self.source.is_some() as u8 + self.file.is_some() as u8 + self.files.is_some() as u8;
+        if provided == 1 {
+            Ok(())
+        } else {
+            Err("must provide exactly one of `source`, `file`, or `files`".into())
+        }
+    }
+
     fn compile_vrl_program(
         &self,
         enrichment_tables: TableRegistry,
         metrics_storage: MetricsStorage,
         merged_schema_definition: schema::Definition,
     ) -> Result<(Program, String, MeaningList)> {
+        self.validate_single_source()?;
+
         if let Some((_, res)) = self
             .cache
             .lock()
@@ -199,19 +348,21 @@ impl RemapConfig {
             return res.clone().map_err(Into::into);
         }
 
-        let source = match (&self.source, &self.file, &self.files) {
-            (Some(source), None, None) => source.to_owned(),
-            (None, Some(path), None) => Self::read_file(path)?,
-            (None, None, Some(paths)) => {
-                let mut combined_source = String::new();
-                for path in paths {
-                    let content = Self::read_file(path)?;
-                    combined_source.push_str(&content);
-                    combined_source.push('\n');
-                }
-                combined_source
+        let files = self.resolved_files();
+        let source = if files.is_empty() {
+            match &self.source {
+                Some(VrlProgram::Source(s)) => s.to_owned(),
+                Some(VrlProgram::Structured(VrlProgramType::Vrl { program })) => program.to_owned(),
+                Some(VrlProgram::Structured(VrlProgramType::Disk { .. })) | None => String::new(),
             }
-            _ => return Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
+        } else {
+            let mut combined_source = String::new();
+            for path in files {
+                let content = Self::read_file(path)?;
+                combined_source.push_str(&content);
+                combined_source.push('\n');
+            }
+            combined_source
         };
 
         let state = TypeState {
@@ -253,9 +404,37 @@ impl RemapConfig {
             .with_context(|_| FileReadFailedSnafu { path })?;
         Ok(buffer)
     }
+
+    /// The files this config loads its VRL program from, if any.
+    ///
+    /// When no `source` is set, honor the deprecated top-level `file`/`files` fields so a config
+    /// constructed directly in Rust behaves the same as one loaded from a legacy config file.
+    fn resolved_files(&self) -> Vec<&PathBuf> {
+        match &self.source {
+            Some(VrlProgram::Structured(VrlProgramType::Disk { files })) => files.iter().collect(),
+            Some(VrlProgram::Source(_) | VrlProgram::Structured(VrlProgramType::Vrl { .. })) => {
+                vec![]
+            }
+            None => self
+                .file
+                .iter()
+                .chain(self.files.iter().flatten())
+                .collect(),
+        }
+    }
 }
 
-impl_generate_config_from_default!(RemapConfig);
+impl GenerateConfig for RemapConfig {
+    fn generate_config() -> toml::Value {
+        // Emit a valid inline `source` so the generated config round-trips: the deserializer
+        // requires exactly one of `source`, `file`, or `files`.
+        toml::Value::try_from(Self {
+            source: Some(VrlProgram::Source(".my_field = \"value\"".to_string())),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+}
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "remap")]
@@ -405,10 +584,7 @@ impl TransformConfig for RemapConfig {
     }
 
     fn files_to_watch(&self) -> Vec<&PathBuf> {
-        self.file
-            .iter()
-            .chain(self.files.iter().flatten())
-            .collect()
+        self.resolved_files()
     }
 }
 
@@ -672,9 +848,6 @@ fn push_dropped(event: Event, output: &mut TransformOutputsBuf) {
 
 #[derive(Debug, Snafu)]
 pub enum BuildError {
-    #[snafu(display("must provide exactly one of `source` or `file` or `files` configuration"))]
-    SourceAndOrFileOrFiles,
-
     #[snafu(display("Could not open vrl program {:?}: {}", path, source))]
     FileOpenFailed { path: PathBuf, source: io::Error },
     #[snafu(display("Could not read vrl program {:?}: {}", path, source))]
@@ -749,32 +922,183 @@ mod tests {
 
     #[test]
     fn config_missing_source_and_file() {
-        let config = RemapConfig {
-            source: None,
-            file: None,
-            ..Default::default()
-        };
-
-        let err = remap(config).unwrap_err().to_string();
-        assert_eq!(
-            &err,
-            "must provide exactly one of `source` or `file` or `files` configuration"
-        )
+        let err = serde_yaml::from_str::<RemapConfig>("{}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must provide exactly one of"));
     }
 
     #[test]
     fn config_both_source_and_file() {
+        let err = serde_yaml::from_str::<RemapConfig>(indoc! {"
+            source: '. = {}'
+            file: ./foo.vrl
+        "})
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must provide exactly one of"));
+    }
+
+    #[test]
+    fn config_source_vrl_object() {
+        let config = serde_yaml::from_str::<RemapConfig>(indoc! {"
+            source:
+              type: vrl
+              program: '.num = 1'
+        "})
+        .unwrap();
+        assert!(matches!(
+            config.source,
+            Some(VrlProgram::Structured(VrlProgramType::Vrl { program })) if program == ".num = 1"
+        ));
+    }
+
+    #[test]
+    fn config_source_disk() {
+        let config = serde_yaml::from_str::<RemapConfig>(indoc! {"
+            source:
+              type: disk
+              files:
+                - ./foo.vrl
+                - ./bar.vrl
+        "})
+        .unwrap();
+        assert!(matches!(
+            config.source,
+            Some(VrlProgram::Structured(VrlProgramType::Disk { files }))
+                if files == vec![PathBuf::from("./foo.vrl"), PathBuf::from("./bar.vrl")]
+        ));
+    }
+
+    #[test]
+    fn config_source_inline() {
+        let config = serde_yaml::from_str::<RemapConfig>(indoc! {"
+            source: '. = {}'
+        "})
+        .unwrap();
+        assert!(matches!(config.source, Some(VrlProgram::Source(s)) if s == ". = {}"));
+    }
+
+    #[test]
+    fn empty_source_round_trips() {
+        // `source: ""` is a valid no-op program; it must survive serialize -> deserialize
+        // (for example, `vector convert-config` relies on this).
+        let cfg: RemapConfig = serde_yaml::from_str("source: ''\n").unwrap();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            yaml.contains("source:"),
+            "empty source dropped on serialize:\n{yaml}"
+        );
+        serde_yaml::from_str::<RemapConfig>(&yaml).expect("serialized config must re-parse");
+    }
+
+    #[test]
+    fn file_only_config_omits_source_on_serialize() {
+        // A `file`-only config must not gain a spurious empty `source` when serialized, or reload
+        // would see two source fields and fail the exactly-one check.
+        let cfg: RemapConfig = serde_yaml::from_str("file: ./a.vrl\n").unwrap();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("source:"),
+            "file-only config gained a source on serialize:\n{yaml}"
+        );
+        serde_yaml::from_str::<RemapConfig>(&yaml).expect("serialized config must re-parse");
+    }
+
+    #[test]
+    fn config_source_disk_rejects_unknown_key() {
+        let err = serde_yaml::from_str::<RemapConfig>(indoc! {"
+            source:
+              type: disk
+              files:
+                - ./foo.vrl
+              file: ./bar.vrl
+        "})
+        .unwrap_err()
+        .to_string();
+        // The unknown `file` key is rejected. `VrlProgram` is untagged, so serde reports the
+        // generic variant-mismatch rather than naming the field, but the typo still fails to parse.
+        assert!(
+            err.contains("did not match any variant"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn directly_constructed_legacy_files_are_honored() {
+        // Configs built in Rust bypass deserialization, so the deprecated `file`/`files` fields
+        // must still be resolved rather than silently ignored in favor of the empty `source`.
+        let with_files = RemapConfig {
+            files: Some(vec![PathBuf::from("a.vrl"), PathBuf::from("b.vrl")]),
+            ..Default::default()
+        };
+        assert_eq!(
+            with_files.resolved_files(),
+            vec![&PathBuf::from("a.vrl"), &PathBuf::from("b.vrl")]
+        );
+
+        let with_file = RemapConfig {
+            file: Some(PathBuf::from("a.vrl")),
+            ..Default::default()
+        };
+        assert_eq!(with_file.resolved_files(), vec![&PathBuf::from("a.vrl")]);
+    }
+
+    #[test]
+    fn directly_constructed_conflicting_sources_are_rejected() {
+        // Deserialization enforces exactly-one, but direct construction bypasses it; the compile
+        // path must still reject conflicting combinations rather than silently pick one.
+        let conflict = RemapConfig {
+            source: Some(VrlProgram::Source(".foo = 1".to_string())),
+            file: Some(PathBuf::from("a.vrl")),
+            ..Default::default()
+        };
+        assert!(conflict.validate_single_source().is_err());
+
+        // ...and so must an entirely empty config.
+        assert!(RemapConfig::default().validate_single_source().is_err());
+    }
+
+    #[test]
+    fn disk_source_reads_file_and_is_watched() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, r#".from_file = "loaded""#).unwrap();
+        let path = file.path().to_path_buf();
+
         let config = RemapConfig {
-            source: Some("".to_owned()),
-            file: Some("".into()),
+            source: Some(VrlProgram::Structured(VrlProgramType::Disk {
+                files: vec![path.clone()],
+            })),
             ..Default::default()
         };
 
-        let err = remap(config).unwrap_err().to_string();
-        assert_eq!(
-            &err,
-            "must provide exactly one of `source` or `file` or `files` configuration"
-        )
+        // The disk file participates in file watching...
+        assert_eq!(config.files_to_watch(), vec![&path]);
+
+        // ...and its contents are compiled and executed.
+        let mut tform = remap(config).unwrap();
+        let result = transform_one(&mut tform, Event::from(LogEvent::from("hi"))).unwrap();
+        assert_eq!(get_field_string(&result, "from_file"), "loaded");
+    }
+
+    #[test]
+    fn vrl_source_object_compiles_and_executes() {
+        let config = RemapConfig {
+            source: Some(VrlProgram::Structured(VrlProgramType::Vrl {
+                program: r#".from_program = "ran""#.to_string(),
+            })),
+            ..Default::default()
+        };
+
+        // A `type: vrl` object watches no files...
+        assert!(config.files_to_watch().is_empty());
+
+        // ...and its inline program is compiled and executed.
+        let mut tform = remap(config).unwrap();
+        let result = transform_one(&mut tform, Event::from(LogEvent::from("hi"))).unwrap();
+        assert_eq!(get_field_string(&result, "from_program"), "ran");
     }
 
     fn get_field_string(event: &Event, field: &str) -> String {
@@ -789,8 +1113,7 @@ mod tests {
     #[test]
     fn check_remap_doesnt_share_state_between_events() {
         let conf = RemapConfig {
-            source: Some(".foo = .sentinel".to_string()),
-            file: None,
+            source: Some(VrlProgram::Source(".foo = .sentinel".to_string())),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -836,8 +1159,7 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(r#"  . = "root string";"#.to_string()),
-            file: None,
+            source: Some(VrlProgram::Source(r#"  . = "root string";"#.to_string())),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -869,14 +1191,13 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(
+            source: Some(VrlProgram::Source(
                 r#"  .foo = "bar"
   .bar = "baz"
   .copy = .copy_from
 "#
                 .to_string(),
-            ),
-            file: None,
+            )),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -902,13 +1223,12 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(
+            source: Some(VrlProgram::Source(
                 indoc! {r"
                 . = .events
             "}
                 .to_owned(),
-            ),
-            file: None,
+            )),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -934,12 +1254,11 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .foo = "foo"
                 .not_an_int = int!(.bar)
                 .baz = 12
-            "#}),
-            file: None,
+            "#})),
             drop_on_error: false,
             drop_on_abort: false,
             ..Default::default()
@@ -965,12 +1284,11 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .foo = "foo"
                 .not_an_int = int!(.bar)
                 .baz = 12
-            "#}),
-            file: None,
+            "#})),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -989,11 +1307,10 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .foo = "foo"
                 .baz = 12
-            "#}),
-            file: None,
+            "#})),
             drop_on_error: false,
             drop_on_abort: false,
             ..Default::default()
@@ -1025,12 +1342,11 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .foo = "foo"
                 abort
                 .baz = 12
-            "#}),
-            file: None,
+            "#})),
             drop_on_error: false,
             drop_on_abort: false,
             ..Default::default()
@@ -1056,12 +1372,11 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .foo = "foo"
                 abort
                 .baz = 12
-            "#}),
-            file: None,
+            "#})),
             drop_on_error: false,
             drop_on_abort: true,
             ..Default::default()
@@ -1081,14 +1396,13 @@ mod tests {
         let metadata = metric.metadata().clone();
 
         let conf = RemapConfig {
-            source: Some(
+            source: Some(VrlProgram::Source(
                 r#".tags.host = "zoobub"
                        .name = "zork"
                        .namespace = "zerk"
                        .kind = "incremental""#
                     .to_string(),
-            ),
-            file: None,
+            )),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -1123,9 +1437,9 @@ mod tests {
         )
         .unwrap();
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .timestamp = parse_timestamp!(.timestamp, format: "%Y-%m-%d %H:%M:%S")
-            "#}),
+            "#})),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: true,
@@ -1160,9 +1474,9 @@ mod tests {
         )
         .unwrap();
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 .timestamp = parse_timestamp!(.timestamp, format: "%Y-%m-%d %H:%M:%S")
-            "#}),
+            "#})),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: true,
@@ -1234,7 +1548,7 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 if exists(.tags) {{
                     # metrics
                     .tags.foo = "bar"
@@ -1248,7 +1562,7 @@ mod tests {
                       abort
                     }}
                 }}
-            "#}),
+            "#})),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: true,
@@ -1394,10 +1708,10 @@ mod tests {
         let error_trigger_default_assert_message =
             Event::from_json_value(serde_json::json!({"hello": 0}), LogNamespace::Legacy).unwrap();
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 assert_eq!(.hello, 0, "custom message here")
                 assert_eq!(.hello, 1)
-            "#}),
+            "#})),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: true,
@@ -1455,9 +1769,9 @@ mod tests {
         let error =
             Event::from_json_value(serde_json::json!({"hello": 42}), LogNamespace::Legacy).unwrap();
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 abort "custom message here"
-            "#}),
+            "#})),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: true,
@@ -1503,7 +1817,7 @@ mod tests {
             Event::from_json_value(serde_json::json!({"hello": 42}), LogNamespace::Legacy).unwrap();
 
         let conf = RemapConfig {
-            source: Some(formatdoc! {r#"
+            source: Some(VrlProgram::Source(formatdoc! {r#"
                 if exists(.tags) {{
                     # metrics
                     .tags.foo = "bar"
@@ -1517,7 +1831,7 @@ mod tests {
                       abort
                     }}
                 }}
-            "#}),
+            "#})),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: false,
@@ -1659,7 +1973,7 @@ mod tests {
     async fn emits_internal_events() {
         assert_transform_compliance(async move {
             let config = RemapConfig {
-                source: Some("abort".to_owned()),
+                source: Some(VrlProgram::Source("abort".to_owned())),
                 drop_on_abort: true,
                 ..Default::default()
             };
@@ -1684,12 +1998,12 @@ mod tests {
 
         // Transform 1 sets a simple value.
         let transform1 = RemapConfig {
-            source: Some(r#".thing = "potato""#.to_string()),
+            source: Some(VrlProgram::Source(r#".thing = "potato""#.to_string())),
             ..Default::default()
         };
 
         let transform2 = RemapConfig {
-            source: Some(".thang = .thing".to_string()),
+            source: Some(VrlProgram::Source(".thang = .thing".to_string())),
             ..Default::default()
         };
 
@@ -1745,20 +2059,22 @@ mod tests {
 
         // Transform 1 sets a simple value.
         let transform1 = RemapConfig {
-            source: Some(
+            source: Some(VrlProgram::Source(
                 indoc! {
-                r#"
+                    r#"
                 .thing = [{"cabbage": 32}, {"parsnips": 45}]
                 . = unnest(.thing)
                 "#
                 }
                 .to_string(),
-            ),
+            )),
             ..Default::default()
         };
 
         let transform2 = RemapConfig {
-            source: Some(r#".thang = .thing.cabbage || "beetroot""#.to_string()),
+            source: Some(VrlProgram::Source(
+                r#".thang = .thing.cabbage || "beetroot""#.to_string(),
+            )),
             ..Default::default()
         };
 
@@ -1835,7 +2151,7 @@ mod tests {
         // An abort should not change the typedef.
 
         let transform1 = RemapConfig {
-            source: Some(r"abort".to_string()),
+            source: Some(VrlProgram::Source(r"abort".to_string())),
             ..Default::default()
         };
 
@@ -1874,7 +2190,9 @@ mod tests {
         // returning schema definitions.
         let transform1 = RemapConfig {
             // This enrichment table does not exist.
-            source: Some(r#". |= get_enrichment_table_record("carrot", {"id": .id})"#.to_string()),
+            source: Some(VrlProgram::Source(
+                r#". |= get_enrichment_table_record("carrot", {"id": .id})"#.to_string(),
+            )),
             reroute_dropped: true,
             ..Default::default()
         };
@@ -1903,7 +2221,7 @@ mod tests {
     fn test_non_object_events() {
         let transform1 = RemapConfig {
             // This enrichment table does not exist.
-            source: Some(r#". = "fish" "#.to_string()),
+            source: Some(VrlProgram::Source(r#". = "fish" "#.to_string())),
             ..Default::default()
         };
 
@@ -1933,7 +2251,7 @@ mod tests {
     #[test]
     fn test_array_and_non_object_events() {
         let transform1 = RemapConfig {
-            source: Some(
+            source: Some(VrlProgram::Source(
                 indoc! {r#"
                     if .lizard == true {
                         .thing = [{"cabbage": 42}];
@@ -1943,7 +2261,7 @@ mod tests {
                     }
                     "#}
                 .to_string(),
-            ),
+            )),
             ..Default::default()
         };
 
@@ -1992,12 +2310,11 @@ mod tests {
         };
 
         let conf = RemapConfig {
-            source: Some(
+            source: Some(VrlProgram::Source(
                 r". = [null]
 "
                 .to_string(),
-            ),
-            file: None,
+            )),
             drop_on_error: true,
             drop_on_abort: false,
             ..Default::default()
@@ -2032,7 +2349,7 @@ mod tests {
         vector_lib::metrics::init_test();
 
         let config = RemapConfig {
-            source: Some(source),
+            source: Some(VrlProgram::Source(source)),
             drop_on_error: true,
             drop_on_abort: true,
             reroute_dropped: true,

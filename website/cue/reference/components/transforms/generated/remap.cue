@@ -34,12 +34,12 @@ generated: components: transforms: remap: configuration: {
 		type: bool: default: false
 	}
 	file: {
+		deprecated:         true
+		deprecated_message: "This field is deprecated, use `source` with `type: disk` instead."
 		description: """
 			File path to the [Vector Remap Language][vrl] (VRL) program to execute for each event.
 
 			If a relative path is provided, its root is the current working directory.
-
-			Required if `source` is missing.
 
 			[vrl]: https://vector.dev/docs/reference/vrl
 			"""
@@ -47,12 +47,12 @@ generated: components: transforms: remap: configuration: {
 		type: string: {}
 	}
 	files: {
+		deprecated:         true
+		deprecated_message: "This field is deprecated, use `source` with `type: disk` instead."
 		description: """
 			File paths to the [Vector Remap Language][vrl] (VRL) programs to execute for each event.
 
 			If a relative path is provided, its root is the current working directory.
-
-			Required if `source` or `file` are missing.
 
 			[vrl]: https://vector.dev/docs/reference/vrl
 			"""
@@ -98,22 +98,62 @@ generated: components: transforms: remap: configuration: {
 	}
 	source: {
 		description: """
-			The [Vector Remap Language][vrl] (VRL) program to execute for each event.
+			The VRL program to execute.
 
-			Required if `file` is missing.
-
-			[vrl]: https://vector.dev/docs/reference/vrl
+			Provide it as an inline string, as `{ type: vrl, program: "..." }`, or as
+			`{ type: disk, files: [...] }` to load one or more programs from disk. Exactly one of
+			`source`, `file`, or `files` must be set.
 			"""
-		required: true
-		type: string: {
-			examples: ["""
-				. = parse_json!(.message)
-				.new_field = "new value"
-				.status = to_int!(.status)
-				.duration = parse_duration!(.duration, "s")
-				.new_name = del(.old_name)
-				"""]
-			syntax: "remap_program"
+		required: false
+		type: {
+			object: options: {
+				files: {
+					description: """
+						File paths to the [Vector Remap Language][vrl] (VRL) programs to execute for each event.
+
+						If a relative path is provided, its root is the current working directory.
+
+						[vrl]: https://vector.dev/docs/reference/vrl
+						"""
+					relevant_when: "type = \"disk\""
+					required:      true
+					type: array: items: type: string: examples: ["path/to/program_1.vrl", "path/to/program_2.vrl"]
+				}
+				program: {
+					description:   "The inline VRL program to execute for each event."
+					relevant_when: "type = \"vrl\""
+					required:      true
+					type: string: {
+						examples: ["""
+															. = parse_json!(.message)
+															.new_field = "new value"
+															"""]
+						syntax: "remap_program"
+					}
+				}
+				type: {
+					description: "The source of the VRL program."
+					required:    true
+					type: string: enum: {
+						disk: "VRL programs loaded from files on disk, concatenated in order."
+						vrl: """
+															An inline [Vector Remap Language][vrl] (VRL) program.
+
+															[vrl]: https://vector.dev/docs/reference/vrl
+															"""
+					}
+				}
+			}
+			string: {
+				examples: ["""
+					. = parse_json!(.message)
+					.new_field = "new value"
+					.status = to_int!(.status)
+					.duration = parse_duration!(.duration, "s")
+					.new_name = del(.old_name)
+					"""]
+				syntax: "remap_program"
+			}
 		}
 	}
 	timezone: {

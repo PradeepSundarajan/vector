@@ -5,6 +5,18 @@ import YAML from "yaml";
 
 const cueJsonOutput = "data/docs.json";
 
+// Manual minimal-example values for components whose "provide exactly one of these" constraint
+// can't be expressed in the schema (so every alternative is optional and the auto-generated
+// minimal example would omit them all). Keyed by component kind, then type.
+const MANUAL_MINIMAL_PARAMS = {
+  transforms: {
+    // `remap` requires exactly one of `source`/`file`/`files`, all optional in the schema.
+    // Remove this once the deprecated `file`/`files` fields are dropped and `source` is made
+    // required again (then the minimal example includes it automatically).
+    remap: { source: '.my_field = "value"' }
+  }
+};
+
 // Helper functions
 const getExampleValue = (param, deepFilter) => {
   let value;
@@ -390,6 +402,12 @@ const main = () => {
           (p) => p.required || p.minimal,
           (p) => p.required || p.minimal
         );
+
+        // Some components have a "provide exactly one of these" constraint the schema can't
+        // express, so all the alternatives are optional and the minimal example would omit them
+        // all (producing an invalid config). Supply a representative value for those cases.
+        const manualMinimal = MANUAL_MINIMAL_PARAMS[kind]?.[componentType];
+        if (manualMinimal) Object.assign(minimalParams, manualMinimal);
         const hasFieldExamples = (p) => Object.values(p.type || {}).some((t) => (t.examples || []).length > 0);
         const advancedParams = Object.makeExampleParams(
           configuration,

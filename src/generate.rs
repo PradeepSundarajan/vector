@@ -665,7 +665,7 @@ mod tests {
 
         assert_eq!(
             generate_example(&opts, TransformInputsStrategy::Auto).unwrap(),
-            indoc::indoc! {r"
+            indoc::indoc! {r#"
             data_dir: /var/lib/vector/
             sources:
               source0:
@@ -686,6 +686,7 @@ mod tests {
                 metric_tag_values: single
                 reroute_dropped: false
                 runtime: ast
+                source: .my_field = "value"
                 type: remap
             sinks:
               sink0:
@@ -704,7 +705,7 @@ mod tests {
                   type: memory
                   max_events: 500
                   when_full: block
-            "}
+            "#}
         );
     }
 
@@ -751,6 +752,7 @@ mod tests {
                   "metric_tag_values": "single",
                   "reroute_dropped": false,
                   "runtime": "ast",
+                  "source": ".my_field = \"value\"",
                   "type": "remap"
                 }
               },
